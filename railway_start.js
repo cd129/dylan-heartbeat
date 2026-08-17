@@ -1,10 +1,13 @@
 const { spawn } = require("child_process");
 const path = require("path");
 
-// 批注 2026-08-10：Railway 默认只执行一个 start command；公开版必须在同一容器同时托管
+// Railway 默认只执行一个 start command；公开版必须在同一容器同时托管
 // Gateway 与 wake-up，才能共享本地/Volume 时间线。这里统一转发退出信号，避免后台子进程悄悄死掉。
+// Gateway 使用 server_patched.js：
+// - 普通 Kelivo 对话会知道 Bark 的真实能力边界，不再索要 Device Key；
+// - /admin/test-bark 会真正发 Bark 推送，而不是只写时间线假事件。
 const processes = [
-  ["gateway", "server.js"],
+  ["gateway", "server_patched.js"],
   ["wake-up", "wake_up.js"]
 ].map(([name, file]) => ({
   name,
