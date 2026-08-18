@@ -82,9 +82,19 @@ function toOpenAiTools(tools) {
   }));
 }
 
+function validatedExecutorBase(env = process.env) {
+  const raw = String(env.GARDEN_MCP_EXECUTOR_URL || DEFAULT_EXECUTOR_URL).trim();
+  const url = new URL(raw);
+  const local = ["localhost", "127.0.0.1", "::1"].includes(url.hostname);
+  const railwayPrivate = url.hostname.endsWith(".railway.internal");
+  if (url.protocol !== "https:" && !(url.protocol === "http:" && (local || railwayPrivate))) {
+    throw new Error("GARDEN_MCP_EXECUTOR_URL must use HTTPS unless it targets localhost or Railway private networking");
+  }
+  return url.toString().replace(/\/+$/, "");
+}
+
 function executorEndpoint(path, env = process.env) {
-  const base = String(env.GARDEN_MCP_EXECUTOR_URL || DEFAULT_EXECUTOR_URL).replace(/\/+$/, "");
-  return `${base}/${path}`;
+  return `${validatedExecutorBase(env)}/${path}`;
 }
 
 async function executorRequest(path, payload = {}, env = process.env) {
@@ -164,6 +174,29 @@ function toolErrorMessage(toolCallId, name, message) {
   };
 }
 
+function normalizeModelToolCalls(toolCalls, round) {
+  return toolCalls.map((call, index) => {
+    const id = String(call?.id || `garden-tool-${round}-${index}`);
+    const name = String(call?.function?.name || "");
+    const args = call?.function?.arguments;
+    return {
+      ...call,
+      id,
+      type: call?.type || "function",
+      function: {
+        ...(call?.function || {}),
+        name,
+        arguments:
+          typeof args === "string"
+            ? args
+            : args && typeof args === "object"
+              ? JSON.stringify(args)
+              : "{}"
+      }
+    };
+  });
+}
+
 async function runGardenAgent({
   messages,
   env = process.env,
@@ -186,9 +219,9 @@ async function runGardenAgent({
   for (let round = 0; round < maxRounds; round += 1) {
     const data = await callModel(transcript, tools, env);
     const message = data?.choices?.[0]?.message || {};
-    const toolCalls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
+    const rawToolCalls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
 
-    if (toolCalls.length === 0) {
+    if (rawToolCalls.length === 0) {
       return {
         rawText: modelContentText(message.content),
         toolCallsExecuted,
@@ -197,6 +230,7 @@ async function runGardenAgent({
       };
     }
 
+    const toolCalls = normalizeModelToolCalls(rawToolCalls, round);
     transcript.push({
       role: "assistant",
       content: message.content ?? null,
@@ -204,8 +238,8 @@ async function runGardenAgent({
     });
 
     for (let index = 0; index < toolCalls.length; index += 1) {
-      const call = toolCalls[index] || {};
-      const callId = String(call.id || `garden-tool-${round}-${index}`);
+      const call = toolCalls[index];
+      const callId = call.id;
       const name = String(call.function?.name || "").trim();
       const definition = toolMap.get(name);
 
@@ -291,10 +325,12 @@ module.exports = {
   executorEndpoint,
   listGardenTools,
   modelContentText,
+  normalizeModelToolCalls,
   normalizeToolDefinitions,
   parseToolArguments,
   readBoolean,
   runGardenAgent,
   toolResultContent,
-  toOpenAiTools
+  toOpenAiTools,
+  validatedExecutorBase
 };
