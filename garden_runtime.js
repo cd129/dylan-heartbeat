@@ -4,7 +4,11 @@ const { buildNtfyPayload } = require("./ntfy_priority");
 const { runtimeFile } = require("./runtime_paths");
 const { formatDateTimeInTimeZone, resolveTimeZone } = require("./time_utils");
 const { validateRuntimeWake } = require("./garden_protocol");
-const { AutonomousWriteUncertainError, runGardenAgent } = require("./garden_agent");
+const {
+  AutonomousPostWriteSafetyStopError,
+  AutonomousWriteUncertainError,
+  runGardenAgent
+} = require("./garden_agent");
 
 const DEFAULT_DEDUPE_MS = 15_000;
 const DEFAULT_PUSH_TIMEOUT_MS = 15_000;
@@ -192,10 +196,48 @@ function eventMetadata(wake) {
   return `来源：Galatea Garden｜reason：${wake.reason}｜事件：${normalizeEventSummary(wake.message)}`;
 }
 
-async function finishPush({ wake, decision, timestamp, metadata, extraMetadata = "" }) {
+async function recordWithoutReplay(content, logContext) {
+  try {
+    await recordTimelineEvent(content);
+    return true;
+  } catch (error) {
+    console.error("Garden post-write timeline recording failed without wake replay", {
+      ...logContext,
+      name: error?.name || "Error",
+      message: error?.message || String(error)
+    });
+    return false;
+  }
+}
+
+async function finishPush({
+  wake,
+  decision,
+  timestamp,
+  metadata,
+  extraMetadata = "",
+  suppressRetryOnPushFailure = false
+}) {
   const push = await sendPushNotification({ title: decision.title, body: decision.body });
   if (!push.ok) {
     const content = `（${timestamp} 自动唤醒：本次未发送推送｜原因：${push.providerLabel} 推送失败｜${metadata}${extraMetadata}）`;
+    if (suppressRetryOnPushFailure) {
+      const timelineRecorded = await recordWithoutReplay(content, {
+        reason: wake.reason,
+        stage: "push_failed_after_write"
+      });
+      console.error("Garden push failed after autonomous write; wake replay suppressed", {
+        reason: wake.reason,
+        provider: push.providerLabel,
+        timeline_recorded: timelineRecorded
+      });
+      return {
+        action: "push_failed_after_write",
+        provider: push.providerLabel,
+        timelineRecorded,
+        pushFailed: true
+      };
+    }
     await recordTimelineEvent(content);
     const error = new Error(`${push.providerLabel} push failed`);
     error.code = "PUSH_FAILED";
@@ -235,7 +277,32 @@ async function handleUncertainWrite(wake, error) {
     decision,
     timestamp,
     metadata,
-    extraMetadata: `｜安全暂停：${String(error.toolName || "unknown").slice(0, 80)}`
+    extraMetadata: `｜安全暂停：${String(error.toolName || "unknown").slice(0, 80)}`,
+    suppressRetryOnPushFailure: true
+  });
+}
+
+async function handlePostWriteSafetyStop(wake, error) {
+  const timestamp = formatDateTimeInTimeZone(new Date(), resolveTimeZone());
+  const metadata = eventMetadata(wake);
+  const writes = Number(error.writeCallsExecuted) || 0;
+  const decision = {
+    action: "push",
+    title: "花园后台已安全停下",
+    body: "我已经完成了部分花园操作，但后续步骤出现异常。为避免重放这一轮产生额外操作，我没有自动重试。"
+  };
+  console.error("Garden background agent stopped after completed write", {
+    reason: wake.reason,
+    writes,
+    code: error.code || null
+  });
+  return finishPush({
+    wake,
+    decision,
+    timestamp,
+    metadata,
+    extraMetadata: `｜已完成写操作：${writes} 次｜后续安全停止`,
+    suppressRetryOnPushFailure: true
   });
 }
 
@@ -260,6 +327,9 @@ async function runGardenWake(wake) {
     if (error instanceof AutonomousWriteUncertainError || error?.code === "GARDEN_WRITE_UNCERTAIN") {
       return handleUncertainWrite(wake, error);
     }
+    if (error instanceof AutonomousPostWriteSafetyStopError || error?.code === "GARDEN_POST_WRITE_SAFETY_STOP") {
+      return handlePostWriteSafetyStop(wake, error);
+    }
     throw error;
   }
 
@@ -267,17 +337,27 @@ async function runGardenWake(wake) {
   const timestamp = formatDateTimeInTimeZone(new Date(), resolveTimeZone());
   const metadata = eventMetadata(wake);
   const agentMeta = `｜后台工具：${agentResult.toolCallsExecuted} 次，其中写操作 ${agentResult.writeCallsExecuted} 次`;
+  const hasWrites = agentResult.writeCallsExecuted > 0;
 
   if (decision.action === "no_action") {
     const reason = decision.reason ? `｜原因：${decision.reason}` : "";
     const content = `（${timestamp} 自动唤醒：本次未发送推送${reason}｜${metadata}${agentMeta}）`;
-    await recordTimelineEvent(content);
+    let timelineRecorded = true;
+    if (hasWrites) {
+      timelineRecorded = await recordWithoutReplay(content, {
+        reason: wake.reason,
+        stage: "no_action_after_write"
+      });
+    } else {
+      await recordTimelineEvent(content);
+    }
     console.log("Garden wake completed without push", {
       reason: wake.reason,
       tool_calls: agentResult.toolCallsExecuted,
-      writes: agentResult.writeCallsExecuted
+      writes: agentResult.writeCallsExecuted,
+      timeline_recorded: timelineRecorded
     });
-    return { action: "no_action" };
+    return { action: "no_action", timelineRecorded };
   }
 
   const result = await finishPush({
@@ -285,10 +365,12 @@ async function runGardenWake(wake) {
     decision,
     timestamp,
     metadata,
-    extraMetadata: agentMeta
+    extraMetadata: agentMeta,
+    suppressRetryOnPushFailure: hasWrites
   });
-  console.log("Garden wake completed with push", {
+  console.log("Garden wake completed", {
     reason: wake.reason,
+    action: result.action,
     provider: result.provider,
     title_chars: decision.title.length,
     body_chars: decision.body.length,
@@ -326,9 +408,11 @@ module.exports = {
   buildGardenPrompt,
   enqueueGardenWake,
   finishPush,
+  handlePostWriteSafetyStop,
   handleUncertainWrite,
   makeFingerprint,
   normalizeEventSummary,
   parseGardenModelOutput,
+  recordWithoutReplay,
   runGardenWake
 };
