@@ -1,12 +1,21 @@
 // Runtime patch for Dylan Heartbeat on Railway.
-// Keeps upstream source changes minimal while fixing two deployment-level issues:
+// Keeps upstream source changes minimal while fixing deployment-level issues:
 // 1) ordinary Kelivo chats know the Bark capability boundary without ever seeing the key;
-// 2) /admin/test-bark actually sends a Bark push instead of only writing a fake timeline event.
+// 2) /admin/test-bark actually sends a Bark push instead of only writing a fake timeline event;
+// 3) a secret-protected Garden wake endpoint can trigger the existing model/push/timeline runtime.
 
 const Fastify = require("fastify");
 const originalFetch = global.fetch;
+const { safeSecretEqual } = require("./garden_auth");
+const { enqueueGardenWake } = require("./garden_runtime");
 
-const RUNTIME_AWARENESS = `\n\n## Dylan Heartbeat 运行环境说明\n- 你通过 Dylan Heartbeat 获得“后台自主唤醒后向用户发送 Bark 推送”的能力。\n- Bark Device Key 由服务器安全保管，你看不到、也不需要知道它；不要向用户索要 Bark Key、Device Key 或 Bark 专属链接。\n- 普通聊天回复本身不能直接触发 Bark 推送。只有后台自动唤醒流程会根据你的输出决定是否推送，并由服务器代为发送。\n- 如果用户在普通聊天里要求“现在给 Bark 发一条测试消息”，请如实说明普通聊天不能直接触发推送；不要假装已经发送。`;
+const RUNTIME_AWARENESS = `
+
+## Dylan Heartbeat 运行环境说明
+- 你通过 Dylan Heartbeat 获得“后台自主唤醒后向用户发送 Bark 推送”的能力。
+- Bark Device Key 由服务器安全保管，你看不到、也不需要知道它；不要向用户索要 Bark Key、Device Key 或 Bark 专属链接。
+- 普通聊天回复本身不能直接触发 Bark 推送。只有后台自动唤醒流程会根据你的输出决定是否推送，并由服务器代为发送。
+- 如果用户在普通聊天里要求“现在给 Bark 发一条测试消息”，请如实说明普通聊天不能直接触发推送；不要假装已经发送。`;
 
 function injectRuntimeAwareness(payload) {
   if (!payload || !Array.isArray(payload.messages)) return payload;
@@ -86,8 +95,48 @@ async function sendRealBarkTest() {
   }
 }
 
+async function handleGardenWakeRequest(req, reply) {
+  const expected = String(process.env.GARDEN_WAKE_SHARED_SECRET || "").trim();
+  const supplied = String(req.headers["x-garden-wake-secret"] || "");
+
+  if (!expected) {
+    return reply.code(503).send({
+      success: false,
+      error: "Garden wake endpoint is not configured"
+    });
+  }
+  if (!safeSecretEqual(expected, supplied)) {
+    return reply.code(401).send({ success: false, error: "unauthorized" });
+  }
+
+  try {
+    const result = await enqueueGardenWake(req.body);
+    return reply.send({
+      success: true,
+      action: result.action,
+      ...(result.provider ? { provider: result.provider } : {}),
+      ...(typeof result.timelineRecorded === "boolean"
+        ? { timeline_recorded: result.timelineRecorded }
+        : {})
+    });
+  } catch (error) {
+    const message = String(error?.message || "");
+    const validationFailure =
+      message.startsWith("invalid Garden") ||
+      message.startsWith("unsupported Garden");
+    console.error("Garden wake request failed", {
+      name: error?.name || "Error",
+      message: validationFailure ? "invalid Garden wake payload" : message
+    });
+    return reply.code(validationFailure ? 400 : 502).send({
+      success: false,
+      error: validationFailure ? "invalid Garden wake payload" : "Garden wake processing failed"
+    });
+  }
+}
+
 // Monkey-patch Fastify factory before loading server.js. We only replace the handlers
-// for the two existing test routes, keeping their original Basic Auth preHandler/options.
+// for the two existing test routes and register one isolated Garden endpoint.
 const Module = require("module");
 const originalLoad = Module._load;
 Module._load = function patchedLoad(request, parent, isMain) {
@@ -95,6 +144,7 @@ Module._load = function patchedLoad(request, parent, isMain) {
     return function patchedFastify(...args) {
       const app = Fastify(...args);
       const originalGet = app.get.bind(app);
+
       app.get = function patchedGet(path, options, handler) {
         if (path === "/test-bark" || path === "/admin/test-bark") {
           const hasOptions = typeof options === "object" && options !== null;
@@ -108,6 +158,8 @@ Module._load = function patchedLoad(request, parent, isMain) {
         }
         return originalGet(path, options, handler);
       };
+
+      app.post("/internal/garden-wake", handleGardenWakeRequest);
       return app;
     };
   }
