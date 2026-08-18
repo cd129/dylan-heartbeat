@@ -25,8 +25,14 @@ function decideRequestAccess({
   // /test-bark 只是穿过网络层，路由本身仍必须通过与管理页相同的 Basic Auth。
   if (requestPath.startsWith("/admin") || requestPath === "/healthz" || requestPath === "/test-bark") return { allow: true };
 
+  // Garden 唤醒桥运行在独立 Railway service，无法以 localhost 身份进入主 Gateway。
+  // 仅让这一条精确路由穿过网络层；server_patched.js 的路由仍必须通过独立的
+  // GARDEN_WAKE_SHARED_SECRET 常量时间校验。未配置密钥时该路由 fail closed 为 503。
+  // 这样不会放宽其他 /internal/* 写接口，也不把 Railway 私网地址本身当作认证凭据。
+  if (requestPath === "/internal/garden-wake") return { allow: true };
+
   // 批注 2026-08-10：云平台反代的 10/172/192.168 地址不代表最终访客可信；
-  // 内部写接口只接受同容器 localhost，不能被公网代理转发后伪造心跳或唤醒事件。
+  // 其余内部写接口只接受同容器 localhost，不能被公网代理转发后伪造心跳或唤醒事件。
   if (requestPath.startsWith("/internal/")) {
     return isLoopbackIp(ip) ? { allow: true } : { allow: false, status: 403, error: "Forbidden" };
   }
