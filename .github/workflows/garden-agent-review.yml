@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   test:
@@ -23,6 +23,16 @@ jobs:
           node-version: '20'
           cache: npm
       - run: npm install
+      - name: Commit generated package lock on review branch
+        if: github.event_name == 'push'
+        run: |
+          if ! git diff --quiet -- package-lock.json; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add package-lock.json
+            git commit -m "Update package lock for MCP client"
+            git push origin HEAD:garden-background-agent
+          fi
       - run: npm test
       - run: node --check garden_agent.js
       - run: node --check garden_mcp_client.js
