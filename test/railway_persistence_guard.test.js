@@ -7,12 +7,26 @@ const assert = require("node:assert/strict");
 const {
   PROBE_FILE,
   isRailwayRuntime,
+  mountInfoHasPath,
   prepareRailwayPersistence
 } = require("../railway_persistence_guard");
+
+function mountInfoFor(dir) {
+  const encoded = String(dir)
+    .replace(/\\/g, "\\134")
+    .replace(/ /g, "\\040");
+  return `123 45 0:99 / ${encoded} rw,relatime - ext4 /dev/mock rw\n`;
+}
 
 test("detects Railway runtime only from Railway markers", () => {
   assert.equal(isRailwayRuntime({}), false);
   assert.equal(isRailwayRuntime({ RAILWAY_PROJECT_ID: "p" }), true);
+});
+
+test("recognizes exact Linux mount points including escaped spaces", () => {
+  assert.equal(mountInfoHasPath("1 2 0:1 / /app/data rw - ext4 /dev/mock rw\n", "/app/data"), true);
+  assert.equal(mountInfoHasPath("1 2 0:1 / /app/data2 rw - ext4 /dev/mock rw\n", "/app/data"), false);
+  assert.equal(mountInfoHasPath("1 2 0:1 / /app/my\\040data rw - ext4 /dev/mock rw\n", "/app/my data"), true);
 });
 
 test("does not touch persistence outside Railway", () => {
@@ -47,6 +61,23 @@ test("fails closed if DATA_DIR points somewhere other than the Railway volume", 
   }
 });
 
+test("fails closed if the configured path is not a real Linux mount point", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "railway-persistence-unmounted-"));
+  const env = {
+    RAILWAY_PROJECT_ID: "p",
+    RAILWAY_VOLUME_MOUNT_PATH: dir,
+    DATA_DIR: dir
+  };
+  try {
+    assert.throws(
+      () => prepareRailwayPersistence(env, new Date("2026-08-18T00:00:00Z"), { mountInfoText: "" }),
+      /not an active Linux mount point/
+    );
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("creates then advances a persistent boot probe", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "railway-persistence-probe-"));
   const env = {
@@ -54,13 +85,14 @@ test("creates then advances a persistent boot probe", () => {
     RAILWAY_VOLUME_MOUNT_PATH: dir,
     DATA_DIR: dir
   };
+  const options = { mountInfoText: mountInfoFor(dir) };
 
   try {
-    const first = prepareRailwayPersistence(env, new Date("2026-08-18T01:00:00Z"));
+    const first = prepareRailwayPersistence(env, new Date("2026-08-18T01:00:00Z"), options);
     assert.equal(first.probeExisting, false);
     assert.equal(first.probeBoots, 1);
 
-    const second = prepareRailwayPersistence(env, new Date("2026-08-18T02:00:00Z"));
+    const second = prepareRailwayPersistence(env, new Date("2026-08-18T02:00:00Z"), options);
     assert.equal(second.probeExisting, true);
     assert.equal(second.probeBoots, 2);
 
@@ -84,7 +116,7 @@ test("fails closed on a corrupt persistence probe", () => {
   try {
     fs.writeFileSync(path.join(dir, PROBE_FILE), "{broken", "utf8");
     assert.throws(
-      () => prepareRailwayPersistence(env),
+      () => prepareRailwayPersistence(env, new Date(), { mountInfoText: mountInfoFor(dir) }),
       /probe is unreadable/
     );
   } finally {
