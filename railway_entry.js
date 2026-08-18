@@ -28,6 +28,10 @@ if (role === "disabled") {
   // so park the service first, wait for the old container to terminate, then
   // explicitly switch back to garden-wake. This avoids overlapping Garden SSE connections.
   startHealthOnly("disabled");
+} else if (role === "shixie-manual") {
+  // No LLM runs in this role. It executes at most the single explicitly configured
+  // Garden MCP command at process startup, then remains as a private health-only service.
+  require("./shixie_manual_executor").startShixieManualExecutor();
 } else if (role !== "garden-wake") {
   require("./railway_start.js");
 } else {
