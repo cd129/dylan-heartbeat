@@ -31,23 +31,38 @@ if (role === "disabled") {
 } else if (role !== "garden-wake") {
   require("./railway_start.js");
 } else {
+  const { createGardenSidecarApi } = require("./garden_sidecar_api");
   const port = Number(process.env.PORT) || 8080;
   let stopping = false;
   let childExited = false;
+  const sidecar = createGardenSidecarApi();
 
   const healthServer = http.createServer((req, res) => {
-    if (req.url !== "/healthz") {
+    Promise.resolve().then(async () => {
+      if (req.url === "/healthz") {
+        if (childExited) {
+          res.writeHead(503, { "content-type": "application/json" });
+          res.end(JSON.stringify({ ok: false, role: "garden-wake" }));
+          return;
+        }
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true, role: "garden-wake" }));
+        return;
+      }
+
+      if (await sidecar.handle(req, res)) return;
       res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
       res.end("not found\n");
-      return;
-    }
-    if (childExited) {
-      res.writeHead(503, { "content-type": "application/json" });
-      res.end(JSON.stringify({ ok: false, role: "garden-wake" }));
-      return;
-    }
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ ok: true, role: "garden-wake" }));
+    }).catch(error => {
+      console.error("Garden sidecar HTTP handler failed", {
+        name: error?.name || "Error",
+        message: String(error?.message || error).slice(0, 200)
+      });
+      if (!res.headersSent) {
+        res.writeHead(500, { "content-type": "application/json; charset=utf-8" });
+      }
+      if (!res.writableEnded) res.end(JSON.stringify({ success: false, error: "internal error" }));
+    });
   });
 
   const worker = spawn(process.execPath, [path.join(__dirname, "garden_bridge_worker.js")], {
@@ -56,12 +71,18 @@ if (role === "disabled") {
     stdio: "inherit"
   });
 
+  async function closeSidecar() {
+    try { await sidecar.executor.close(); } catch {}
+  }
+
   function finish(exitCode) {
     if (stopping) return;
     stopping = true;
     childExited = true;
-    healthServer.close(() => process.exit(exitCode));
-    setTimeout(() => process.exit(exitCode), 1000).unref();
+    Promise.resolve(closeSidecar()).finally(() => {
+      healthServer.close(() => process.exit(exitCode));
+      setTimeout(() => process.exit(exitCode), 1000).unref();
+    });
   }
 
   function forward(signal) {
@@ -69,8 +90,10 @@ if (role === "disabled") {
     stopping = true;
     if (!worker.killed) worker.kill(signal);
     childExited = true;
-    healthServer.close(() => process.exit(0));
-    setTimeout(() => process.exit(0), 1000).unref();
+    Promise.resolve(closeSidecar()).finally(() => {
+      healthServer.close(() => process.exit(0));
+      setTimeout(() => process.exit(0), 1000).unref();
+    });
   }
 
   worker.on("error", error => {
@@ -94,8 +117,21 @@ if (role === "disabled") {
   healthServer.listen(port, "0.0.0.0", () => {
     console.log("Garden wake Railway entry ready", {
       port,
-      automatic_restart: false
+      automatic_restart: false,
+      mcp_sidecar: true
     });
+
+    const shouldDiscover = ["1", "true", "yes", "on"].includes(
+      String(process.env.GARDEN_MCP_LOG_TOOL_NAMES || "").trim().toLowerCase()
+    );
+    if (shouldDiscover) {
+      sidecar.executor.discoverToolNames()
+        .then(names => console.log("Garden MCP discovered tool names", { count: names.length, names }))
+        .catch(error => console.error("Garden MCP discovery failed", {
+          name: error?.name || "Error",
+          message: String(error?.message || error).slice(0, 200)
+        }));
+    }
   });
 
   process.on("SIGTERM", () => forward("SIGTERM"));
