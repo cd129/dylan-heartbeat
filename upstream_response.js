@@ -4,10 +4,30 @@ function contentText(value) {
   return value.map(part => typeof part === "string" ? part : String(part?.text || part?.content || "")).join("");
 }
 
+function mergeToolCallDelta(map, rawCall, fallbackIndex = 0) {
+  if (!rawCall || typeof rawCall !== "object") return;
+  const index = Number.isInteger(rawCall.index) ? rawCall.index : fallbackIndex;
+  const current = map.get(index) || {
+    id: "",
+    type: "function",
+    function: { name: "", arguments: "" }
+  };
+  if (typeof rawCall.id === "string") current.id = rawCall.id;
+  if (typeof rawCall.type === "string") current.type = rawCall.type;
+  if (rawCall.function && typeof rawCall.function === "object") {
+    if (typeof rawCall.function.name === "string") current.function.name += rawCall.function.name;
+    if (typeof rawCall.function.arguments === "string") current.function.arguments += rawCall.function.arguments;
+  }
+  map.set(index, current);
+}
+
 function parseSseChatCompletion(text) {
   let streamed = "";
   let completed = "";
   let lastPayload = null;
+  let completedToolCalls = null;
+  const toolCallDeltas = new Map();
+
   for (const line of String(text || "").split(/\r?\n/)) {
     const match = line.match(/^data:\s*(.*)$/i);
     if (!match) continue;
@@ -23,12 +43,31 @@ function parseSseChatCompletion(text) {
     const legacy = contentText(choice.text);
     if (delta) streamed += delta;
     else if (message || legacy) completed = message || legacy;
+
+    if (Array.isArray(choice.delta?.tool_calls)) {
+      choice.delta.tool_calls.forEach((call, index) => mergeToolCallDelta(toolCallDeltas, call, index));
+    }
+    if (Array.isArray(choice.message?.tool_calls)) completedToolCalls = choice.message.tool_calls;
   }
+
   const content = streamed || completed;
-  if (!content && !lastPayload) throw new Error("SSE 响应中没有可读取的 data JSON");
+  const streamedToolCalls = Array.from(toolCallDeltas.entries())
+    .sort((a, b) => a[0] - b[0])
+    .map(([, call]) => call)
+    .filter(call => call.id || call.function.name || call.function.arguments);
+  const toolCalls = completedToolCalls || (streamedToolCalls.length > 0 ? streamedToolCalls : undefined);
+
+  if (!content && !toolCalls && !lastPayload) throw new Error("SSE 响应中没有可读取的 data JSON");
   return {
     ...(lastPayload || {}),
-    choices: [{ ...(lastPayload?.choices?.[0] || {}), message: { ...(lastPayload?.choices?.[0]?.message || {}), content } }]
+    choices: [{
+      ...(lastPayload?.choices?.[0] || {}),
+      message: {
+        ...(lastPayload?.choices?.[0]?.message || {}),
+        content,
+        ...(toolCalls ? { tool_calls: toolCalls } : {})
+      }
+    }]
   };
 }
 
@@ -42,4 +81,4 @@ function parseChatCompletionResponse(text, contentType = "") {
   return JSON.parse(raw);
 }
 
-module.exports = { parseChatCompletionResponse, parseSseChatCompletion };
+module.exports = { contentText, mergeToolCallDelta, parseChatCompletionResponse, parseSseChatCompletion };
