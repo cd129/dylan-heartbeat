@@ -2,6 +2,7 @@ const http = require("http");
 const { GardenMcpClient, readConfig } = require("./garden_mcp_client");
 
 const OFFICIAL_GARDEN_MCP = "https://galatea.abysslumina.com/mcp";
+const MAX_COMMAND_FUTURE_MS = 10 * 60 * 1000;
 const ALLOWED_TOOLS = new Set([
   "list_games",
   "join_game",
@@ -75,6 +76,22 @@ function validateCommand(name, args) {
   return toolName;
 }
 
+function validateCommandWindow(rawExpiry, nowMs = Date.now()) {
+  const expiryMs = Number(String(rawExpiry || "").trim());
+  if (!Number.isFinite(expiryMs) || !Number.isInteger(expiryMs)) {
+    throw new Error("SHIXIE_GARDEN_COMMAND_EXPIRES_AT must be an epoch-millisecond integer");
+  }
+  if (expiryMs <= nowMs) {
+    const error = new Error("Shixie Garden command expired before execution");
+    error.code = "SHIXIE_COMMAND_EXPIRED";
+    throw error;
+  }
+  if (expiryMs - nowMs > MAX_COMMAND_FUTURE_MS) {
+    throw new Error("Shixie Garden command expiry is too far in the future");
+  }
+  return expiryMs;
+}
+
 function safeError(error) {
   return {
     name: error?.name || "Error",
@@ -83,13 +100,14 @@ function safeError(error) {
   };
 }
 
-async function executeConfiguredCommand({ env = process.env, clientFactory } = {}) {
+async function executeConfiguredCommand({ env = process.env, clientFactory, nowMs = Date.now() } = {}) {
   const args = parseCommandArgs(env.SHIXIE_GARDEN_ARGS_JSON);
   const toolName = validateCommand(env.SHIXIE_GARDEN_COMMAND, args);
   if (!toolName) return { skipped: true, reason: "no command configured" };
 
   const nonce = String(env.SHIXIE_GARDEN_REQUEST_NONCE || "").trim();
   if (!nonce) throw new Error("SHIXIE_GARDEN_REQUEST_NONCE is required when a command is configured");
+  validateCommandWindow(env.SHIXIE_GARDEN_COMMAND_EXPIRES_AT, nowMs);
 
   const config = readManualConfig(env);
   const client = clientFactory ? clientFactory(config) : new GardenMcpClient(config);
@@ -123,10 +141,6 @@ function startShixieManualExecutor() {
     console.log("Shixie manual Garden executor ready", { port, no_llm: true, public_api: false });
     executeConfiguredCommand()
       .then(output => {
-        if (output.skipped) {
-          console.log("SHIXIE_GARDEN_RESULT", JSON.stringify(output));
-          return;
-        }
         console.log("SHIXIE_GARDEN_RESULT", JSON.stringify(output));
       })
       .catch(error => {
@@ -141,11 +155,13 @@ function startShixieManualExecutor() {
 
 module.exports = {
   ALLOWED_TOOLS,
+  MAX_COMMAND_FUTURE_MS,
   OFFICIAL_GARDEN_MCP,
   WRITE_TOOLS,
   executeConfiguredCommand,
   parseCommandArgs,
   readManualConfig,
   startShixieManualExecutor,
-  validateCommand
+  validateCommand,
+  validateCommandWindow
 };
