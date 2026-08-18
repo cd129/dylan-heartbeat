@@ -240,11 +240,10 @@ function afterWriteOrRethrow(error, writeCallsExecuted) {
 }
 
 function isVerifiedGameTurnWake(messages) {
-  if (!Array.isArray(messages)) return false;
-  return messages.some(message =>
-    message?.role === "system" &&
-    String(message?.content || "").split(/\r?\n/).includes(GAME_TURN_REASON_LINE)
-  );
+  if (!Array.isArray(messages) || messages.length === 0) return false;
+  const wakeMessage = messages[messages.length - 1];
+  if (wakeMessage?.role !== "system") return false;
+  return String(wakeMessage?.content || "").split(/\r?\n/).includes(GAME_TURN_REASON_LINE);
 }
 
 function parseGameStatus(result) {
@@ -262,7 +261,7 @@ function parseGameStatus(result) {
 function gameTurnGuardMessage(result, status) {
   const serialized = toolResultContent(result);
   const actionInstruction = status === "acting"
-    ? "The parsed status is acting. You MUST complete a legal game action with the attached write tool before returning final text. Use only available_actions from this latest status and include the latest state_version as required by the tool schema. Do not output [NO_ACTION] while this status is acting."
+    ? "The parsed status is acting. You MUST successfully call submit_action for exactly one legal game action before returning final text. Use only available_actions from this latest status and include the latest state_version as required by the tool schema. Do not output [NO_ACTION] while this status is acting."
     : "The parsed status is not acting. Do not make a game write unless a later verified tool result shows that it is your turn.";
   return [
     "## Deterministic Garden game-turn guard",
@@ -297,6 +296,7 @@ async function runGardenAgent({
   let toolCallsExecuted = 0;
   let writeCallsExecuted = 0;
   let mustCompleteGameAction = false;
+  let gameActionCompleted = false;
 
   if (isVerifiedGameTurnWake(transcript)) {
     if (!toolsEnabled) throw new Error("game_turn_required requires Garden tools to be enabled");
@@ -321,6 +321,12 @@ async function runGardenAgent({
     const status = parseGameStatus(statusResult);
     if (!status) throw new Error("game-turn preflight could not parse current game status");
     mustCompleteGameAction = status === "acting";
+    if (mustCompleteGameAction) {
+      const actionTool = toolMap.get("submit_action");
+      if (!actionTool || !actionTool.write) {
+        throw new Error("acting game turn requires writable submit_action");
+      }
+    }
     transcript.push({ role: "system", content: gameTurnGuardMessage(statusResult, status) });
   }
 
@@ -336,11 +342,11 @@ async function runGardenAgent({
     const rawToolCalls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
 
     if (rawToolCalls.length === 0) {
-      if (mustCompleteGameAction && writeCallsExecuted === 0) {
+      if (mustCompleteGameAction && !gameActionCompleted) {
         transcript.push({ role: "assistant", content: message.content ?? null });
         transcript.push({
           role: "system",
-          content: "The verified game-turn preflight still requires a legal action. Your previous response attempted to finish without a successful game write. Continue now: use the latest available_actions and state_version from the preflight status, call the legal game write tool, and only then return final text."
+          content: "The verified game-turn preflight still requires a legal action. Your previous response attempted to finish without a successful submit_action. Continue now: use the latest available_actions and state_version from the preflight status, call submit_action, and only then return final text."
         });
         continue;
       }
@@ -410,6 +416,7 @@ async function runGardenAgent({
                 message: "This exact autonomous write already succeeded earlier and was not repeated."
               })
             });
+            if (name === "submit_action") gameActionCompleted = true;
             continue;
           }
           throw new AutonomousWriteUncertainError(name, new Error(`prior write status: ${reservation.status}`));
@@ -426,6 +433,7 @@ async function runGardenAgent({
           }
           markWriteAction(reservation.key, "succeeded", env);
           writeCallsExecuted += 1;
+          if (name === "submit_action") gameActionCompleted = true;
         }
         transcript.push({
           role: "tool",
