@@ -48,11 +48,18 @@ function ensurePlainObject(value) {
   return value && typeof value === "object" && !Array.isArray(value) ? value : {};
 }
 
+function safeInputSchema(value) {
+  const schema = ensurePlainObject(value);
+  return Object.keys(schema).length > 0
+    ? schema
+    : { type: "object", properties: {}, additionalProperties: false };
+}
+
 function safeToolDefinition(tool, write) {
   return {
     name: String(tool?.name || ""),
     description: typeof tool?.description === "string" ? tool.description : "",
-    inputSchema: ensurePlainObject(tool?.inputSchema),
+    inputSchema: safeInputSchema(tool?.inputSchema),
     write: Boolean(write)
   };
 }
@@ -114,15 +121,20 @@ class GardenMcpClient {
   async listAllTools() {
     return this.runExclusive(async () => {
       const client = await this.connect();
-      const tools = [];
-      let cursor;
-      for (let page = 0; page < MAX_TOOL_PAGES; page += 1) {
-        const result = await client.listTools(cursor ? { cursor } : undefined);
-        if (Array.isArray(result?.tools)) tools.push(...result.tools);
-        cursor = result?.nextCursor;
-        if (!cursor) return tools;
+      try {
+        const tools = [];
+        let cursor;
+        for (let page = 0; page < MAX_TOOL_PAGES; page += 1) {
+          const result = await client.listTools(cursor ? { cursor } : undefined);
+          if (Array.isArray(result?.tools)) tools.push(...result.tools);
+          cursor = result?.nextCursor;
+          if (!cursor) return tools;
+        }
+        throw new Error("Garden MCP returned too many tool pages");
+      } catch (error) {
+        await this.invalidate();
+        throw error;
       }
-      throw new Error("Garden MCP returned too many tool pages");
     });
   }
 
@@ -182,5 +194,6 @@ module.exports = {
   parseCsvSet,
   readConfig,
   readPolicy,
+  safeInputSchema,
   safeToolDefinition
 };
