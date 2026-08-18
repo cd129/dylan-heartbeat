@@ -4,6 +4,7 @@ const { markWrite, reserveWrite } = require("./garden_action_journal");
 const DEFAULT_EXECUTOR_URL = "http://garden-wake.railway.internal:8080/internal/mcp";
 const DEFAULT_UPSTREAM_TIMEOUT_MS = 300_000;
 const DEFAULT_EXECUTOR_TIMEOUT_MS = 30_000;
+const DEFAULT_TOTAL_TIMEOUT_MS = 270_000;
 const DEFAULT_MAX_ROUNDS = 6;
 const DEFAULT_MAX_TOOL_CALLS = 8;
 const DEFAULT_MAX_WRITE_CALLS = 2;
@@ -15,6 +16,16 @@ class AutonomousWriteUncertainError extends Error {
     this.name = "AutonomousWriteUncertainError";
     this.code = "GARDEN_WRITE_UNCERTAIN";
     this.toolName = toolName;
+    this.cause = cause;
+  }
+}
+
+class AutonomousPostWriteSafetyStopError extends Error {
+  constructor(cause, writeCallsExecuted) {
+    super("Garden background agent stopped after a completed write to avoid wake replay");
+    this.name = "AutonomousPostWriteSafetyStopError";
+    this.code = "GARDEN_POST_WRITE_SAFETY_STOP";
+    this.writeCallsExecuted = writeCallsExecuted;
     this.cause = cause;
   }
 }
@@ -66,7 +77,7 @@ function normalizeToolDefinitions(tools) {
       inputSchema:
         tool.inputSchema && typeof tool.inputSchema === "object" && !Array.isArray(tool.inputSchema)
           ? tool.inputSchema
-          : { type: "object", properties: {} },
+          : { type: "object", properties: {}, additionalProperties: false },
       write: Boolean(tool.write)
     }));
 }
@@ -90,6 +101,9 @@ function validatedExecutorBase(env = process.env) {
   if (url.protocol !== "https:" && !(url.protocol === "http:" && (local || railwayPrivate))) {
     throw new Error("GARDEN_MCP_EXECUTOR_URL must use HTTPS unless it targets localhost or Railway private networking");
   }
+  if (url.username || url.password || url.search || url.hash) {
+    throw new Error("GARDEN_MCP_EXECUTOR_URL must not contain credentials, query parameters, or fragments");
+  }
   return url.toString().replace(/\/+$/, "");
 }
 
@@ -97,10 +111,18 @@ function executorEndpoint(path, env = process.env) {
   return `${validatedExecutorBase(env)}/${path}`;
 }
 
-async function executorRequest(path, payload = {}, env = process.env) {
+function boundedTimeout(configured, control = {}) {
+  const requested = Number(control.timeoutMs);
+  if (!Number.isFinite(requested)) return configured;
+  if (requested < 1000) throw new Error("Garden background agent total timeout exceeded");
+  return Math.max(1000, Math.min(configured, Math.floor(requested)));
+}
+
+async function executorRequest(path, payload = {}, env = process.env, control = {}) {
   const secret = String(env.GARDEN_WAKE_SHARED_SECRET || "").trim();
   if (!secret) throw new Error("GARDEN_WAKE_SHARED_SECRET is required for Garden MCP executor");
-  const timeoutMs = positiveNumber(env.GARDEN_MCP_EXECUTOR_TIMEOUT_MS, DEFAULT_EXECUTOR_TIMEOUT_MS, 1000);
+  const configuredTimeoutMs = positiveNumber(env.GARDEN_MCP_EXECUTOR_TIMEOUT_MS, DEFAULT_EXECUTOR_TIMEOUT_MS, 1000);
+  const timeoutMs = boundedTimeout(configuredTimeoutMs, control);
   const response = await fetch(executorEndpoint(path, env), {
     method: "POST",
     signal: AbortSignal.timeout(timeoutMs),
@@ -121,25 +143,26 @@ async function executorRequest(path, payload = {}, env = process.env) {
   return body;
 }
 
-async function listGardenTools(env = process.env) {
-  const body = await executorRequest("tools", {}, env);
+async function listGardenTools(env = process.env, control = {}) {
+  const body = await executorRequest("tools", {}, env, control);
   return normalizeToolDefinitions(body.tools);
 }
 
-async function callGardenTool(name, args, env = process.env) {
-  const body = await executorRequest("call", { name, arguments: args }, env);
+async function callGardenTool(name, args, env = process.env, control = {}) {
+  const body = await executorRequest("call", { name, arguments: args }, env, control);
   return body.result;
 }
 
-async function callUpstreamModel(messages, tools, env = process.env) {
+async function callUpstreamModel(messages, tools, env = process.env, control = {}) {
   if (!env.TARGET_API_URL || !env.TARGET_API_KEY || !env.MODEL_NAME) {
     throw new Error("TARGET_API_URL / TARGET_API_KEY / MODEL_NAME is not fully configured");
   }
-  const timeoutMs = positiveNumber(
+  const configuredTimeoutMs = positiveNumber(
     env.GARDEN_WAKE_UPSTREAM_TIMEOUT_MS,
     positiveNumber(env.WAKE_UPSTREAM_TIMEOUT_MS, DEFAULT_UPSTREAM_TIMEOUT_MS, 1000),
     1000
   );
+  const timeoutMs = boundedTimeout(configuredTimeoutMs, control);
   const body = {
     model: env.MODEL_NAME,
     messages,
@@ -197,6 +220,24 @@ function normalizeModelToolCalls(toolCalls, round) {
   });
 }
 
+function createDeadline(env = process.env, now = Date.now()) {
+  const totalTimeoutMs = positiveNumber(env.GARDEN_AGENT_TOTAL_TIMEOUT_MS, DEFAULT_TOTAL_TIMEOUT_MS, 1000);
+  return now + totalTimeoutMs;
+}
+
+function remainingControl(deadline, now = Date.now()) {
+  const timeoutMs = deadline - now;
+  if (timeoutMs < 1000) throw new Error("Garden background agent total timeout exceeded");
+  return { timeoutMs };
+}
+
+function afterWriteOrRethrow(error, writeCallsExecuted) {
+  if (writeCallsExecuted > 0) {
+    throw new AutonomousPostWriteSafetyStopError(error, writeCallsExecuted);
+  }
+  throw error;
+}
+
 async function runGardenAgent({
   messages,
   env = process.env,
@@ -206,18 +247,29 @@ async function runGardenAgent({
   reserveWriteAction = reserveWrite,
   markWriteAction = markWrite
 }) {
+  const deadline = createDeadline(env);
   const toolsEnabled = readBoolean(env.GARDEN_AGENT_TOOLS_ENABLED, false);
-  const tools = toolsEnabled ? await listTools(env) : [];
+  let tools = [];
+  if (toolsEnabled) {
+    tools = await listTools(env, remainingControl(deadline));
+  }
   const toolMap = new Map(tools.map(tool => [tool.name, tool]));
   const transcript = Array.isArray(messages) ? messages.map(message => ({ ...message })) : [];
   const maxRounds = positiveNumber(env.GARDEN_AGENT_MAX_ROUNDS, DEFAULT_MAX_ROUNDS, 1);
   const maxToolCalls = positiveNumber(env.GARDEN_AGENT_MAX_TOOL_CALLS, DEFAULT_MAX_TOOL_CALLS, 1);
   const maxWriteCalls = positiveNumber(env.GARDEN_AGENT_MAX_WRITE_CALLS, DEFAULT_MAX_WRITE_CALLS, 0);
+  let toolCallsSeen = 0;
   let toolCallsExecuted = 0;
   let writeCallsExecuted = 0;
 
   for (let round = 0; round < maxRounds; round += 1) {
-    const data = await callModel(transcript, tools, env);
+    let data;
+    try {
+      data = await callModel(transcript, tools, env, remainingControl(deadline));
+    } catch (error) {
+      afterWriteOrRethrow(error, writeCallsExecuted);
+    }
+
     const message = data?.choices?.[0]?.message || {};
     const rawToolCalls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
 
@@ -229,6 +281,11 @@ async function runGardenAgent({
         toolsAvailable: tools.map(tool => tool.name)
       };
     }
+
+    if (toolCallsSeen + rawToolCalls.length > maxToolCalls) {
+      afterWriteOrRethrow(new Error("Garden background agent exceeded its tool-call budget"), writeCallsExecuted);
+    }
+    toolCallsSeen += rawToolCalls.length;
 
     const toolCalls = normalizeModelToolCalls(rawToolCalls, round);
     transcript.push({
@@ -247,10 +304,6 @@ async function runGardenAgent({
         transcript.push(toolErrorMessage(callId, name || "unknown", "Tool is not available to the background Garden runtime."));
         continue;
       }
-      if (toolCallsExecuted >= maxToolCalls) {
-        transcript.push(toolErrorMessage(callId, name, "Background Garden tool-call limit reached."));
-        continue;
-      }
 
       let args;
       try {
@@ -263,6 +316,13 @@ async function runGardenAgent({
       if (definition.write && writeCallsExecuted >= maxWriteCalls) {
         transcript.push(toolErrorMessage(callId, name, "Background Garden write limit reached."));
         continue;
+      }
+
+      let control;
+      try {
+        control = remainingControl(deadline);
+      } catch (error) {
+        afterWriteOrRethrow(error, writeCallsExecuted);
       }
 
       let reservation = null;
@@ -287,7 +347,7 @@ async function runGardenAgent({
       }
 
       try {
-        const result = await callTool(name, args, env);
+        const result = await callTool(name, args, env, control);
         toolCallsExecuted += 1;
         if (definition.write) {
           if (result?.isError === true) {
@@ -315,13 +375,16 @@ async function runGardenAgent({
     }
   }
 
-  throw new Error("Garden background agent exceeded its maximum model rounds");
+  afterWriteOrRethrow(new Error("Garden background agent exceeded its maximum model rounds"), writeCallsExecuted);
 }
 
 module.exports = {
+  AutonomousPostWriteSafetyStopError,
   AutonomousWriteUncertainError,
+  boundedTimeout,
   callGardenTool,
   callUpstreamModel,
+  createDeadline,
   executorEndpoint,
   listGardenTools,
   modelContentText,
@@ -329,6 +392,7 @@ module.exports = {
   normalizeToolDefinitions,
   parseToolArguments,
   readBoolean,
+  remainingControl,
   runGardenAgent,
   toolResultContent,
   toOpenAiTools,
