@@ -23,11 +23,78 @@ function startHealthOnly(roleName) {
   process.on("SIGINT", stop);
 }
 
+function startGardenSidecarOnly() {
+  const { createGardenSidecarApi } = require("./garden_sidecar_api");
+  const port = Number(process.env.PORT) || 8080;
+  const sidecar = createGardenSidecarApi();
+  let stopping = false;
+
+  const server = http.createServer((req, res) => {
+    Promise.resolve().then(async () => {
+      if (req.url === "/healthz") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true, role: "garden-sidecar" }));
+        return;
+      }
+
+      if (await sidecar.handle(req, res)) return;
+      res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
+      res.end("not found\n");
+    }).catch(error => {
+      console.error("Garden sidecar-only HTTP handler failed", {
+        name: error?.name || "Error",
+        message: String(error?.message || error).slice(0, 200)
+      });
+      if (!res.headersSent) {
+        res.writeHead(500, { "content-type": "application/json; charset=utf-8" });
+      }
+      if (!res.writableEnded) res.end(JSON.stringify({ success: false, error: "internal error" }));
+    });
+  });
+
+  async function stop() {
+    if (stopping) return;
+    stopping = true;
+    try { await sidecar.executor.close(); } catch {}
+    server.close(() => process.exit(0));
+    setTimeout(() => process.exit(0), 1000).unref();
+  }
+
+  server.listen(port, "0.0.0.0", () => {
+    console.log("Garden sidecar-only Railway entry ready", {
+      port,
+      background_model: false,
+      garden_sse: false,
+      mcp_sidecar: true
+    });
+
+    const shouldDiscover = ["1", "true", "yes", "on"].includes(
+      String(process.env.GARDEN_MCP_LOG_TOOL_NAMES || "").trim().toLowerCase()
+    );
+    if (shouldDiscover) {
+      sidecar.executor.discoverToolNames()
+        .then(names => console.log("Garden MCP discovered tool names", { count: names.length, names }))
+        .catch(error => console.error("Garden MCP discovery failed", {
+          name: error?.name || "Error",
+          message: String(error?.message || error).slice(0, 200)
+        }));
+    }
+  });
+
+  process.on("SIGTERM", stop);
+  process.on("SIGINT", stop);
+}
+
 if (role === "disabled") {
   // Manual parking mode for long-lived SSE services. Railway uses rolling deploys,
   // so park the service first, wait for the old container to terminate, then
   // explicitly switch back to garden-wake. This avoids overlapping Garden SSE connections.
   startHealthOnly("disabled");
+} else if (role === "garden-sidecar") {
+  // ChatGPT/off-platform execution helper. This role intentionally runs no model,
+  // no Dylan heartbeat/timeline, and no Garden SSE listener. It only exposes the
+  // authenticated, policy-filtered Garden MCP sidecar plus /healthz.
+  startGardenSidecarOnly();
 } else if (role !== "garden-wake") {
   require("./railway_start.js");
 } else {
