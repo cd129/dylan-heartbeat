@@ -6,7 +6,8 @@ const {
   executeConfiguredCommand,
   parseCommandArgs,
   readManualConfig,
-  validateCommand
+  validateCommand,
+  validateCommandWindow
 } = require("../shixie_manual_executor");
 
 function baseEnv(overrides = {}) {
@@ -85,6 +86,15 @@ test("submit_action requires idempotency and latest-state protection", () => {
   );
 });
 
+test("manual commands must be fresh and short-lived", () => {
+  const now = 1_800_000_000_000;
+  assert.equal(validateCommandWindow(String(now + 60_000), now), now + 60_000);
+  assert.throws(() => validateCommandWindow(String(now), now), /expired/);
+  assert.throws(() => validateCommandWindow(String(now - 1), now), /expired/);
+  assert.throws(() => validateCommandWindow(String(now + 11 * 60_000), now), /too far/);
+  assert.throws(() => validateCommandWindow("tomorrow", now), /epoch-millisecond/);
+});
+
 test("forbidden Garden tools fail before any MCP client is created", async () => {
   let factoryCalled = false;
   await assert.rejects(
@@ -92,8 +102,10 @@ test("forbidden Garden tools fail before any MCP client is created", async () =>
       env: baseEnv({
         SHIXIE_GARDEN_COMMAND: "create_reply",
         SHIXIE_GARDEN_ARGS_JSON: '{"thread_id":1,"body":"no"}',
-        SHIXIE_GARDEN_REQUEST_NONCE: "n1"
+        SHIXIE_GARDEN_REQUEST_NONCE: "n1",
+        SHIXIE_GARDEN_COMMAND_EXPIRES_AT: "1800000060000"
       }),
+      nowMs: 1_800_000_000_000,
       clientFactory() {
         factoryCalled = true;
         throw new Error("should not run");
@@ -104,15 +116,39 @@ test("forbidden Garden tools fail before any MCP client is created", async () =>
   assert.equal(factoryCalled, false);
 });
 
+test("expired command fails before any MCP client is created", async () => {
+  let factoryCalled = false;
+  await assert.rejects(
+    executeConfiguredCommand({
+      env: baseEnv({
+        SHIXIE_GARDEN_COMMAND: "get_my_status",
+        SHIXIE_GARDEN_ARGS_JSON: '{"since_event_id":0}',
+        SHIXIE_GARDEN_REQUEST_NONCE: "stale-001",
+        SHIXIE_GARDEN_COMMAND_EXPIRES_AT: "1800000000000"
+      }),
+      nowMs: 1_800_000_000_000,
+      clientFactory() {
+        factoryCalled = true;
+        throw new Error("should not run");
+      }
+    }),
+    /expired/
+  );
+  assert.equal(factoryCalled, false);
+});
+
 test("executor performs exactly one configured MCP call and closes the client", async () => {
   const calls = [];
   let closed = false;
+  const now = 1_800_000_000_000;
   const output = await executeConfiguredCommand({
     env: baseEnv({
       SHIXIE_GARDEN_COMMAND: "get_my_status",
       SHIXIE_GARDEN_ARGS_JSON: '{"since_event_id":0}',
-      SHIXIE_GARDEN_REQUEST_NONCE: "status-001"
+      SHIXIE_GARDEN_REQUEST_NONCE: "status-001",
+      SHIXIE_GARDEN_COMMAND_EXPIRES_AT: String(now + 60_000)
     }),
+    nowMs: now,
     clientFactory(config) {
       assert.equal(config.policy.allowed.has("get_my_status"), true);
       return {
