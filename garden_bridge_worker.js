@@ -1,6 +1,6 @@
 const { SseParser, decodeGardenSseEvent } = require("./garden_protocol");
 
-const DEFAULT_BASE_URL = "https://galatea.abysslumina.com";
+const DEFAULT_BASE_URL = "https://wake-v1.abysslumina.com";
 const DEFAULT_CONNECT_TIMEOUT_MS = 15_000;
 const DEFAULT_DELIVERY_TIMEOUT_MS = 330_000;
 const DEFAULT_MAX_ATTEMPTS = 2;
