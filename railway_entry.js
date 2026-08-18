@@ -4,7 +4,31 @@ const { spawn } = require("child_process");
 
 const role = String(process.env.SERVICE_ROLE || "dylan-heartbeat").trim().toLowerCase();
 
-if (role !== "garden-wake") {
+function startHealthOnly(roleName) {
+  const port = Number(process.env.PORT) || 8080;
+  const server = http.createServer((req, res) => {
+    if (req.url !== "/healthz") {
+      res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
+      res.end("not found\n");
+      return;
+    }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ ok: true, role: roleName }));
+  });
+  server.listen(port, "0.0.0.0", () => {
+    console.log("Railway entry running without background worker", { role: roleName, port });
+  });
+  const stop = () => server.close(() => process.exit(0));
+  process.on("SIGTERM", stop);
+  process.on("SIGINT", stop);
+}
+
+if (role === "disabled") {
+  // Manual parking mode for long-lived SSE services. Railway uses rolling deploys,
+  // so park the service first, wait for the old container to terminate, then
+  // explicitly switch back to garden-wake. This avoids overlapping Garden SSE connections.
+  startHealthOnly("disabled");
+} else if (role !== "garden-wake") {
   require("./railway_start.js");
 } else {
   const port = Number(process.env.PORT) || 8080;
