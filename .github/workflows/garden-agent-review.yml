@@ -1,0 +1,31 @@
+name: Garden Agent Review
+
+on:
+  push:
+    branches:
+      - garden-background-agent
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - run: node --check garden_agent.js
+      - run: node --check garden_mcp_client.js
+      - run: node --check garden_sidecar_api.js
+      - run: node --check garden_runtime.js
+      - run: node --check railway_entry.js
