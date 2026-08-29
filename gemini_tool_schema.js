@@ -2,66 +2,152 @@ function isPlainObject(value) {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
+const SUPPORTED_KEYS = new Set([
+  "$ref",
+  "$defs",
+  "type",
+  "nullable",
+  "required",
+  "format",
+  "description",
+  "properties",
+  "items",
+  "enum",
+  "anyOf"
+]);
+
 function sanitizeType(type) {
-  if (typeof type === "string") return type.toLowerCase();
-  return type;
+  return typeof type === "string" ? type.toLowerCase() : type;
+}
+
+function mergeRequired(a, b) {
+  return [...new Set([...(Array.isArray(a) ? a : []), ...(Array.isArray(b) ? b : [])])];
+}
+
+function mergeAllOfIntoObject(out, branches) {
+  let properties = isPlainObject(out.properties) ? { ...out.properties } : null;
+  let required = Array.isArray(out.required) ? [...out.required] : [];
+  let defs = isPlainObject(out.$defs) ? { ...out.$defs } : null;
+
+  for (const branch of branches) {
+    if (!isPlainObject(branch)) continue;
+    if (isPlainObject(branch.properties)) {
+      properties = { ...(properties || {}), ...branch.properties };
+    }
+    required = mergeRequired(required, branch.required);
+    if (isPlainObject(branch.$defs)) defs = { ...(defs || {}), ...branch.$defs };
+  }
+
+  if (properties) out.properties = properties;
+  if (required.length > 0) out.required = required;
+  if (defs) out.$defs = defs;
 }
 
 function sanitizeSchemaNode(schema) {
   if (Array.isArray(schema)) return schema.map(sanitizeSchemaNode);
   if (!isPlainObject(schema)) return schema;
 
+  const originalType = schema.type;
+  const nullableFromType = Array.isArray(originalType)
+    && originalType.map(sanitizeType).includes("null");
+
   const out = {};
-  for (const [key, value] of Object.entries(schema)) {
-    if (key === "properties" && isPlainObject(value)) {
-      out.properties = Object.fromEntries(
-        Object.entries(value).map(([name, child]) => [name, sanitizeSchemaNode(child)])
-      );
-      continue;
-    }
 
-    if ((key === "$defs" || key === "definitions") && isPlainObject(value)) {
-      out[key] = Object.fromEntries(
-        Object.entries(value).map(([name, child]) => [name, sanitizeSchemaNode(child)])
-      );
-      continue;
-    }
-
-    if (["anyOf", "oneOf", "allOf", "prefixItems"].includes(key) && Array.isArray(value)) {
-      out[key] = value.map(sanitizeSchemaNode);
-      continue;
-    }
-
-    if (["items", "additionalProperties", "not", "contains", "propertyNames"].includes(key) && isPlainObject(value)) {
-      out[key] = sanitizeSchemaNode(value);
-      continue;
-    }
-
-    out[key] = value;
+  if (isPlainObject(schema.properties)) {
+    out.properties = Object.fromEntries(
+      Object.entries(schema.properties).map(([name, child]) => [name, sanitizeSchemaNode(child)])
+    );
   }
 
-  // Gemini/Vertex's function-declaration schema validator requires nodes with
-  // object properties to be OBJECT and nodes with items to be ARRAY. Some
-  // OpenAI-compatible clients emit contradictory or nullable type declarations.
+  const rawDefs = isPlainObject(schema.$defs)
+    ? schema.$defs
+    : isPlainObject(schema.definitions)
+      ? schema.definitions
+      : null;
+  if (rawDefs) {
+    out.$defs = Object.fromEntries(
+      Object.entries(rawDefs).map(([name, child]) => [name, sanitizeSchemaNode(child)])
+    );
+  }
+
+  if (isPlainObject(schema.items)) out.items = sanitizeSchemaNode(schema.items);
+
+  const allOf = Array.isArray(schema.allOf) ? schema.allOf.map(sanitizeSchemaNode) : [];
+  if (allOf.length > 0) mergeAllOfIntoObject(out, allOf);
+
+  let anyOfSource = Array.isArray(schema.anyOf)
+    ? schema.anyOf
+    : Array.isArray(schema.oneOf)
+      ? schema.oneOf
+      : [];
+  let anyOf = anyOfSource.map(sanitizeSchemaNode).filter(isPlainObject);
+
+  for (const key of ["$ref", "nullable", "format", "description"]) {
+    if (schema[key] !== undefined) out[key] = schema[key];
+  }
+
+  if (Array.isArray(schema.required)) out.required = mergeRequired(out.required, schema.required);
+  if (Array.isArray(schema.enum)) out.enum = [...schema.enum];
+  if (Object.prototype.hasOwnProperty.call(schema, "const") && !Array.isArray(out.enum)) {
+    out.enum = [schema.const];
+  }
+
   if (isPlainObject(out.properties)) {
     out.type = "object";
+    if (nullableFromType && out.nullable === undefined) out.nullable = true;
+    // A number of OpenAI-compatible gateways mis-handle a structural object that
+    // also carries oneOf/anyOf and can overwrite its type while retaining properties.
+    // Keep the permissive object shape; its properties still describe valid calls.
+    anyOf = [];
+    delete out.items;
   } else if (Object.prototype.hasOwnProperty.call(out, "items")) {
     out.type = "array";
-  } else if (Array.isArray(out.type)) {
-    const normalized = [...new Set(out.type.map(sanitizeType).filter(type => typeof type === "string"))];
-    const nullable = normalized.includes("null");
+    if (nullableFromType && out.nullable === undefined) out.nullable = true;
+    anyOf = [];
+  } else if (Array.isArray(originalType)) {
+    const normalized = [...new Set(originalType.map(sanitizeType).filter(type => typeof type === "string"))];
     const concrete = normalized.filter(type => type !== "null");
     if (concrete.length === 1) {
       out.type = concrete[0];
-      if (nullable && out.nullable === undefined) out.nullable = true;
+      if (normalized.includes("null") && out.nullable === undefined) out.nullable = true;
     }
-  } else {
-    out.type = sanitizeType(out.type);
+  } else if (typeof originalType === "string") {
+    const normalized = sanitizeType(originalType);
+    if (normalized === "null") {
+      out.nullable = true;
+    } else {
+      out.type = normalized;
+    }
   }
 
-  if (Object.prototype.hasOwnProperty.call(out, "const") && !Array.isArray(out.enum)) {
-    out.enum = [out.const];
-    delete out.const;
+  if (anyOf.length > 0) {
+    const nonNull = anyOf.filter(branch => sanitizeType(branch.type) !== "null");
+    const hadNull = nonNull.length !== anyOf.length;
+    if (nonNull.length === 1 && hadNull) {
+      const branch = nonNull[0];
+      for (const [key, value] of Object.entries(branch)) {
+        if (key === "description" && out.description !== undefined) continue;
+        out[key] = value;
+      }
+      out.nullable = true;
+    } else {
+      out.anyOf = anyOf;
+    }
+  }
+
+  // Vertex's legacy FunctionDeclaration.parameters accepts only a documented
+  // OpenAPI subset. Strip keywords such as additionalProperties/default/examples/
+  // oneOf/allOf that intermediary gateways frequently translate incorrectly.
+  for (const key of Object.keys(out)) {
+    if (!SUPPORTED_KEYS.has(key)) delete out[key];
+  }
+
+  if (out.type === "object") {
+    if (!isPlainObject(out.properties)) out.properties = {};
+    if (Array.isArray(out.required)) {
+      out.required = out.required.filter(name => Object.prototype.hasOwnProperty.call(out.properties, name));
+      if (out.required.length === 0) delete out.required;
+    }
   }
 
   return out;
@@ -70,7 +156,10 @@ function sanitizeSchemaNode(schema) {
 function sanitizeFunctionDefinition(fn) {
   if (!isPlainObject(fn)) return fn;
   if (!isPlainObject(fn.parameters)) return fn;
-  return { ...fn, parameters: sanitizeSchemaNode(fn.parameters) };
+  const parameters = sanitizeSchemaNode(fn.parameters);
+  parameters.type = "object";
+  if (!isPlainObject(parameters.properties)) parameters.properties = {};
+  return { ...fn, parameters };
 }
 
 function sanitizeOpenAiToolSchemas(payload) {
@@ -98,10 +187,40 @@ function sanitizeOpenAiToolSchemas(payload) {
   }
 
   if (!changed) return payload;
-  return { ...payload, ...(tools !== payload.tools ? { tools } : {}), ...(functions !== payload.functions ? { functions } : {}) };
+  return {
+    ...payload,
+    ...(tools !== payload.tools ? { tools } : {}),
+    ...(functions !== payload.functions ? { functions } : {})
+  };
+}
+
+function findStructuralConflicts(schema, path = "parameters", found = []) {
+  if (!isPlainObject(schema)) return found;
+  if (isPlainObject(schema.properties) && sanitizeType(schema.type) !== "object") {
+    found.push(`${path}:properties/type=${String(schema.type)}`);
+  }
+  if (Object.prototype.hasOwnProperty.call(schema, "items") && sanitizeType(schema.type) !== "array") {
+    found.push(`${path}:items/type=${String(schema.type)}`);
+  }
+  if (isPlainObject(schema.properties)) {
+    for (const [name, child] of Object.entries(schema.properties)) {
+      findStructuralConflicts(child, `${path}.${name}`, found);
+    }
+  }
+  if (isPlainObject(schema.items)) findStructuralConflicts(schema.items, `${path}[]`, found);
+  if (Array.isArray(schema.anyOf)) {
+    schema.anyOf.forEach((child, index) => findStructuralConflicts(child, `${path}.anyOf[${index}]`, found));
+  }
+  if (isPlainObject(schema.$defs)) {
+    for (const [name, child] of Object.entries(schema.$defs)) {
+      findStructuralConflicts(child, `${path}.$defs.${name}`, found);
+    }
+  }
+  return found;
 }
 
 module.exports = {
+  findStructuralConflicts,
   sanitizeOpenAiToolSchemas,
   sanitizeSchemaNode
 };
