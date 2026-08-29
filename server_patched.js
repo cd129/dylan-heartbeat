@@ -1,13 +1,18 @@
 // Runtime patch for Dylan Heartbeat on Railway.
 // Keeps upstream source changes minimal while fixing deployment-level issues:
-// 1) ordinary Kelivo chats know the Bark capability boundary without ever seeing the key;
-// 2) /admin/test-bark actually sends a Bark push instead of only writing a fake timeline event;
-// 3) a secret-protected Garden wake endpoint can trigger the existing model/push/timeline runtime.
+// 1) ordinary Kelivo/Aru chats know the Bark capability boundary without ever seeing the key;
+// 2) timestamp-less Aru turns are stamped at gateway receipt so wake-up recency stays correct;
+// 3) /admin/test-bark actually sends a Bark push instead of only writing a fake timeline event;
+// 4) a secret-protected Garden wake endpoint can trigger the existing model/push/timeline runtime.
 
 const Fastify = require("fastify");
 const originalFetch = global.fetch;
 const { safeSecretEqual } = require("./garden_auth");
 const { enqueueGardenWake } = require("./garden_runtime");
+const { stampLatestUserMessage } = require("./gateway_chat_timestamp");
+const { formatDateTimeInTimeZone, resolveTimeZone } = require("./time_utils");
+
+const TIME_ZONE = resolveTimeZone();
 
 const RUNTIME_AWARENESS = `
 
@@ -37,6 +42,20 @@ function injectRuntimeAwareness(payload) {
   }
 
   return { ...payload, messages };
+}
+
+function stampCurrentChatTurn(req) {
+  if (!req || req.method !== "POST") return false;
+  const path = String(req.url || "").split("?", 1)[0];
+  if (path !== "/v1/chat/completions") return false;
+  const body = req.body;
+  if (!body || !Array.isArray(body.messages)) return false;
+
+  const timestamp = formatDateTimeInTimeZone(new Date(), TIME_ZONE);
+  const stamped = stampLatestUserMessage(body, timestamp);
+  if (stamped === body) return false;
+  req.body = stamped;
+  return true;
 }
 
 // Patch fetch only inside the gateway process. wake_up.js still runs as its own process,
@@ -136,7 +155,8 @@ async function handleGardenWakeRequest(req, reply) {
 }
 
 // Monkey-patch Fastify factory before loading server.js. We only replace the handlers
-// for the two existing test routes and register one isolated Garden endpoint.
+// for the two existing test routes, add a timestamp bridge for public chat requests,
+// and register one isolated Garden endpoint.
 const Module = require("module");
 const originalLoad = Module._load;
 Module._load = function patchedLoad(request, parent, isMain) {
@@ -144,6 +164,22 @@ Module._load = function patchedLoad(request, parent, isMain) {
     return function patchedFastify(...args) {
       const app = Fastify(...args);
       const originalGet = app.get.bind(app);
+
+      app.addHook("preHandler", async req => {
+        try {
+          if (stampCurrentChatTurn(req)) {
+            console.log(JSON.stringify({
+              event: "gateway_latest_user_timestamp_injected",
+              time_zone: TIME_ZONE
+            }));
+          }
+        } catch (error) {
+          console.warn("gateway chat timestamp injection skipped", {
+            name: error?.name || "Error",
+            message: String(error?.message || error).slice(0, 160)
+          });
+        }
+      });
 
       app.get = function patchedGet(path, options, handler) {
         if (path === "/test-bark" || path === "/admin/test-bark") {
