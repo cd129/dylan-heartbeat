@@ -11,6 +11,20 @@ test("extracts rejected function name from Vertex schema error", () => {
   assert.equal(extractBadFunctionName(text), "designAtmosphereMotion");
 });
 
+test("extracts rejected function name through escaped outer JSON", () => {
+  const text = JSON.stringify({
+    error: {
+      message: 'upstream status 400: {\\"error\\":{\\"message\\":\\"Unable to submit request because `designThemeSkin` functionDeclaration parameters.gradient.bottom schema specified incorrect schema type field.\\"}}'
+    }
+  });
+  assert.equal(extractBadFunctionName(text), "designThemeSkin");
+});
+
+test("extracts function name despite lightweight markdown wrappers", () => {
+  const text = 'Unable to submit request because **designThemeSkin** functionDeclaration parameters.gradient.bottom schema specified incorrect schema type field.';
+  assert.equal(extractBadFunctionName(text), "designThemeSkin");
+});
+
 test("removes only the rejected OpenAI tool", () => {
   const payload = {
     tools: [
