@@ -2,12 +2,13 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 
 const {
+  encodeDeepVertexTypes,
   findStructuralConflicts,
   sanitizeOpenAiToolSchemas,
   sanitizeSchemaNode
 } = require("../gemini_tool_schema");
 
-test("fixes nested object schemas whose type contradicts properties", () => {
+test("fixes nested object schemas and pre-encodes deep Vertex type enums", () => {
   const input = {
     tools: [{
       type: "function",
@@ -36,10 +37,30 @@ test("fixes nested object schemas whose type contradicts properties", () => {
   };
 
   const output = sanitizeOpenAiToolSchemas(input);
-  const color = output.tools[0].function.parameters.properties.anchors.properties.color;
-  assert.equal(color.type, "object");
-  assert.deepEqual(findStructuralConflicts(output.tools[0].function.parameters), []);
+  const parameters = output.tools[0].function.parameters;
+  const anchors = parameters.properties.anchors;
+  const color = anchors.properties.color;
+  assert.equal(parameters.type, "object");
+  assert.equal(anchors.type, "object");
+  assert.equal(color.type, "OBJECT");
+  assert.equal(color.properties.r.type, "NUMBER");
+  assert.deepEqual(findStructuralConflicts(parameters), []);
   assert.equal(input.tools[0].function.parameters.properties.anchors.properties.color.type, "string");
+});
+
+test("deep enum encoding leaves root and direct parameter types lowercase", () => {
+  const output = encodeDeepVertexTypes({
+    type: "object",
+    properties: {
+      first: {
+        type: "object",
+        properties: { second: { type: "string" } }
+      }
+    }
+  });
+  assert.equal(output.type, "object");
+  assert.equal(output.properties.first.type, "object");
+  assert.equal(output.properties.first.properties.second.type, "STRING");
 });
 
 test("drops conflicting union metadata from structural objects", () => {
