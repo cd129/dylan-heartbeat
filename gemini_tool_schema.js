@@ -38,9 +38,7 @@ function mergeAllOfIntoObject(out, branches) {
 
   for (const branch of branches) {
     if (!isPlainObject(branch)) continue;
-    if (isPlainObject(branch.properties)) {
-      properties = { ...(properties || {}), ...branch.properties };
-    }
+    if (isPlainObject(branch.properties)) properties = { ...(properties || {}), ...branch.properties };
     required = mergeRequired(required, branch.required);
     if (isPlainObject(branch.$defs)) defs = { ...(defs || {}), ...branch.$defs };
   }
@@ -57,7 +55,6 @@ function sanitizeSchemaNode(schema) {
   const originalType = schema.type;
   const nullableFromType = Array.isArray(originalType)
     && originalType.map(sanitizeType).includes("null");
-
   const out = {};
 
   if (isPlainObject(schema.properties)) {
@@ -95,9 +92,7 @@ function sanitizeSchemaNode(schema) {
 
   if (Array.isArray(schema.required)) out.required = mergeRequired(out.required, schema.required);
   if (Array.isArray(schema.enum)) out.enum = [...schema.enum];
-  if (Object.prototype.hasOwnProperty.call(schema, "const") && !Array.isArray(out.enum)) {
-    out.enum = [schema.const];
-  }
+  if (Object.prototype.hasOwnProperty.call(schema, "const") && !Array.isArray(out.enum)) out.enum = [schema.const];
 
   if (isPlainObject(out.properties)) {
     out.type = "object";
@@ -141,7 +136,8 @@ function sanitizeSchemaNode(schema) {
     if (!SUPPORTED_KEYS.has(key)) delete out[key];
   }
 
-  if (out.type === "object") {
+  if (sanitizeType(out.type) === "object") {
+    out.type = "object";
     if (!isPlainObject(out.properties)) out.properties = {};
     if (Array.isArray(out.required)) {
       out.required = out.required.filter(name => Object.prototype.hasOwnProperty.call(out.properties, name));
@@ -152,12 +148,39 @@ function sanitizeSchemaNode(schema) {
   return out;
 }
 
+// GG's OpenAI->Vertex bridge is demonstrably re-corrupting a conflict-free schema
+// at parameters.anchors.color. The failure depth strongly indicates that its legacy
+// FunctionDeclaration conversion stops normalizing type enum values after the first
+// property level. Keep the OpenAI-style lowercase values at root/direct parameters,
+// but pre-encode deeper nodes using Vertex's enum spelling so a shallow converter can
+// safely pass them through.
+function encodeDeepVertexTypes(schema, depth = 0) {
+  if (!isPlainObject(schema)) return schema;
+  const out = { ...schema };
+  if (typeof out.type === "string" && depth >= 2) out.type = out.type.toUpperCase();
+
+  if (isPlainObject(out.properties)) {
+    out.properties = Object.fromEntries(
+      Object.entries(out.properties).map(([name, child]) => [name, encodeDeepVertexTypes(child, depth + 1)])
+    );
+  }
+  if (isPlainObject(out.items)) out.items = encodeDeepVertexTypes(out.items, depth + 1);
+  if (Array.isArray(out.anyOf)) out.anyOf = out.anyOf.map(child => encodeDeepVertexTypes(child, depth + 1));
+  if (isPlainObject(out.$defs)) {
+    out.$defs = Object.fromEntries(
+      Object.entries(out.$defs).map(([name, child]) => [name, encodeDeepVertexTypes(child, depth + 1)])
+    );
+  }
+  return out;
+}
+
 function sanitizeFunctionDefinition(fn) {
   if (!isPlainObject(fn)) return fn;
   if (!isPlainObject(fn.parameters)) return fn;
-  const parameters = sanitizeSchemaNode(fn.parameters);
+  let parameters = sanitizeSchemaNode(fn.parameters);
   parameters.type = "object";
   if (!isPlainObject(parameters.properties)) parameters.properties = {};
+  parameters = encodeDeepVertexTypes(parameters, 0);
   return { ...fn, parameters };
 }
 
@@ -202,23 +225,18 @@ function findStructuralConflicts(schema, path = "parameters", found = []) {
     found.push(`${path}:items/type=${String(schema.type)}`);
   }
   if (isPlainObject(schema.properties)) {
-    for (const [name, child] of Object.entries(schema.properties)) {
-      findStructuralConflicts(child, `${path}.${name}`, found);
-    }
+    for (const [name, child] of Object.entries(schema.properties)) findStructuralConflicts(child, `${path}.${name}`, found);
   }
   if (isPlainObject(schema.items)) findStructuralConflicts(schema.items, `${path}[]`, found);
-  if (Array.isArray(schema.anyOf)) {
-    schema.anyOf.forEach((child, index) => findStructuralConflicts(child, `${path}.anyOf[${index}]`, found));
-  }
+  if (Array.isArray(schema.anyOf)) schema.anyOf.forEach((child, index) => findStructuralConflicts(child, `${path}.anyOf[${index}]`, found));
   if (isPlainObject(schema.$defs)) {
-    for (const [name, child] of Object.entries(schema.$defs)) {
-      findStructuralConflicts(child, `${path}.$defs.${name}`, found);
-    }
+    for (const [name, child] of Object.entries(schema.$defs)) findStructuralConflicts(child, `${path}.$defs.${name}`, found);
   }
   return found;
 }
 
 module.exports = {
+  encodeDeepVertexTypes,
   findStructuralConflicts,
   sanitizeOpenAiToolSchemas,
   sanitizeSchemaNode
