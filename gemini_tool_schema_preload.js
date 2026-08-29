@@ -7,10 +7,14 @@ const {
   removeFunctionsByName
 } = require("./gemini_schema_retry");
 
-// This specific Kelivo tool has repeatedly reached GG as an invalid Vertex
-// FunctionDeclaration even after the outgoing OpenAI schema was structurally clean.
-// Block it before the first GG request rather than relying on parsing GG's 400 body.
-const KNOWN_GG_BAD_TOOL_SCHEMAS = new Set(["designAtmosphereMotion"]);
+// These Kelivo UI-design tools have repeatedly reached GG as invalid Vertex
+// FunctionDeclarations even after the outgoing OpenAI schema was structurally clean.
+// Block confirmed offenders before the first GG request; subsequent offenders are
+// learned automatically from GG's 400 response and remembered for the process lifetime.
+const KNOWN_GG_BAD_TOOL_SCHEMAS = new Set([
+  "designAtmosphereMotion",
+  "designThemeSkin"
+]);
 
 if (!global.__geminiToolSchemaCompatInstalled && typeof global.fetch === "function") {
   const originalFetch = global.fetch;
@@ -48,10 +52,10 @@ if (!global.__geminiToolSchemaCompatInstalled && typeof global.fetch === "functi
         event: "gemini_tool_schema_sanitized",
         tool_count: functions.length,
         designAtmosphereMotion_present: functions.some(fn => fn.name === "designAtmosphereMotion"),
+        designThemeSkin_present: functions.some(fn => fn.name === "designThemeSkin"),
         structural_conflicts_after: conflicts.slice(0, 20),
         structural_conflict_count_after: conflicts.length,
-        blocked_tool_schema_count: badToolSchemas.size,
-        known_bad_tool_block_active: badToolSchemas.has("designAtmosphereMotion")
+        blocked_tool_schema_count: badToolSchemas.size
       }));
     } catch (error) {
       console.warn("Gemini tool-schema compatibility pass skipped", {
@@ -61,7 +65,7 @@ if (!global.__geminiToolSchemaCompatInstalled && typeof global.fetch === "functi
       return originalFetch(input, init);
     }
 
-    const maxSchemaRetries = 3;
+    const maxSchemaRetries = 12;
     let attempt = 0;
     let currentPayload = payload;
 
@@ -89,7 +93,8 @@ if (!global.__geminiToolSchemaCompatInstalled && typeof global.fetch === "functi
         event: "gemini_schema_400_inspected",
         extracted_function: badFunctionName,
         error_mentions_function_declaration: /functionDeclaration/i.test(errorText),
-        error_chars: errorText.length
+        error_chars: errorText.length,
+        retry_attempt: attempt
       }));
 
       if (!badFunctionName) return response;
