@@ -28,6 +28,16 @@ try {
   process.exit(1);
 }
 
+function childEnvironment() {
+  const preload = `--require=${path.join(__dirname, "gemini_tool_schema_preload.js")}`;
+  const existing = String(process.env.NODE_OPTIONS || "").trim();
+  if (existing.includes("gemini_tool_schema_preload.js")) return process.env;
+  return {
+    ...process.env,
+    NODE_OPTIONS: [existing, preload].filter(Boolean).join(" ")
+  };
+}
+
 const processes = [
   ["gateway", "server_patched.js"],
   ["wake-up", "wake_up.js"]
@@ -35,7 +45,7 @@ const processes = [
   name,
   child: spawn(process.execPath, [path.join(__dirname, file)], {
     cwd: __dirname,
-    env: process.env,
+    env: childEnvironment(),
     stdio: "inherit"
   })
 }));
