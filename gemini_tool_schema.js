@@ -24,6 +24,13 @@ function mergeRequired(a, b) {
   return [...new Set([...(Array.isArray(a) ? a : []), ...(Array.isArray(b) ? b : [])])];
 }
 
+function isRawNullSchema(schema) {
+  if (!isPlainObject(schema)) return false;
+  if (sanitizeType(schema.type) === "null") return true;
+  if (Object.prototype.hasOwnProperty.call(schema, "const") && schema.const === null) return true;
+  return Array.isArray(schema.enum) && schema.enum.length === 1 && schema.enum[0] === null;
+}
+
 function mergeAllOfIntoObject(out, branches) {
   let properties = isPlainObject(out.properties) ? { ...out.properties } : null;
   let required = Array.isArray(out.required) ? [...out.required] : [];
@@ -75,7 +82,7 @@ function sanitizeSchemaNode(schema) {
   const allOf = Array.isArray(schema.allOf) ? schema.allOf.map(sanitizeSchemaNode) : [];
   if (allOf.length > 0) mergeAllOfIntoObject(out, allOf);
 
-  let anyOfSource = Array.isArray(schema.anyOf)
+  const anyOfSource = Array.isArray(schema.anyOf)
     ? schema.anyOf
     : Array.isArray(schema.oneOf)
       ? schema.oneOf
@@ -95,9 +102,6 @@ function sanitizeSchemaNode(schema) {
   if (isPlainObject(out.properties)) {
     out.type = "object";
     if (nullableFromType && out.nullable === undefined) out.nullable = true;
-    // A number of OpenAI-compatible gateways mis-handle a structural object that
-    // also carries oneOf/anyOf and can overwrite its type while retaining properties.
-    // Keep the permissive object shape; its properties still describe valid calls.
     anyOf = [];
     delete out.items;
   } else if (Object.prototype.hasOwnProperty.call(out, "items")) {
@@ -113,18 +117,16 @@ function sanitizeSchemaNode(schema) {
     }
   } else if (typeof originalType === "string") {
     const normalized = sanitizeType(originalType);
-    if (normalized === "null") {
-      out.nullable = true;
-    } else {
-      out.type = normalized;
-    }
+    if (normalized === "null") out.nullable = true;
+    else out.type = normalized;
   }
 
   if (anyOf.length > 0) {
-    const nonNull = anyOf.filter(branch => sanitizeType(branch.type) !== "null");
-    const hadNull = nonNull.length !== anyOf.length;
-    if (nonNull.length === 1 && hadNull) {
-      const branch = nonNull[0];
+    const entries = anyOfSource.map((raw, index) => ({ raw, sanitized: anyOf[index] })).filter(entry => entry.sanitized);
+    const nonNullEntries = entries.filter(entry => !isRawNullSchema(entry.raw));
+    const hadNull = nonNullEntries.length !== entries.length;
+    if (nonNullEntries.length === 1 && hadNull) {
+      const branch = nonNullEntries[0].sanitized;
       for (const [key, value] of Object.entries(branch)) {
         if (key === "description" && out.description !== undefined) continue;
         out[key] = value;
@@ -135,9 +137,6 @@ function sanitizeSchemaNode(schema) {
     }
   }
 
-  // Vertex's legacy FunctionDeclaration.parameters accepts only a documented
-  // OpenAPI subset. Strip keywords such as additionalProperties/default/examples/
-  // oneOf/allOf that intermediary gateways frequently translate incorrectly.
   for (const key of Object.keys(out)) {
     if (!SUPPORTED_KEYS.has(key)) delete out[key];
   }
