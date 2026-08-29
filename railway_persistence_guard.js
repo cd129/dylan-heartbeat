@@ -16,33 +16,7 @@ function normalizedAbsolute(value) {
   return path.resolve(String(value || ""));
 }
 
-function decodeMountInfoField(value) {
-  return String(value || "").replace(/\\([0-7]{3})/g, (_, octal) =>
-    String.fromCharCode(Number.parseInt(octal, 8))
-  );
-}
-
-function mountInfoHasPath(mountInfoText, mountPath) {
-  const target = normalizedAbsolute(mountPath);
-  return String(mountInfoText || "")
-    .split("\n")
-    .some(line => {
-      if (!line.trim()) return false;
-      const fields = line.trim().split(/\s+/);
-      if (fields.length < 6) return false;
-      return normalizedAbsolute(decodeMountInfoField(fields[4])) === target;
-    });
-}
-
-function readMountInfo() {
-  try {
-    return fs.readFileSync("/proc/self/mountinfo", "utf8");
-  } catch (error) {
-    throw new Error(`Unable to inspect Linux mount table: ${error?.message || error}`);
-  }
-}
-
-function prepareRailwayPersistence(env = process.env, now = new Date(), options = {}) {
+function prepareRailwayPersistence(env = process.env, now = new Date()) {
   if (!isRailwayRuntime(env)) {
     return { railway: false, checked: false };
   }
@@ -55,13 +29,6 @@ function prepareRailwayPersistence(env = process.env, now = new Date(), options 
   const dataDir = resolveDataDir(env);
   if (normalizedAbsolute(dataDir) !== normalizedAbsolute(mountPath)) {
     throw new Error("DATA_DIR does not match the Railway volume mount path");
-  }
-
-  const mountInfoText = Object.prototype.hasOwnProperty.call(options, "mountInfoText")
-    ? options.mountInfoText
-    : readMountInfo();
-  if (!mountInfoHasPath(mountInfoText, mountPath)) {
-    throw new Error("Railway volume mount path is not an active Linux mount point");
   }
 
   fs.mkdirSync(dataDir, { recursive: true });
@@ -111,8 +78,6 @@ function prepareRailwayPersistence(env = process.env, now = new Date(), options 
 
 module.exports = {
   PROBE_FILE,
-  decodeMountInfoField,
   isRailwayRuntime,
-  mountInfoHasPath,
   prepareRailwayPersistence
 };
