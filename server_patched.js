@@ -11,6 +11,10 @@ const { safeSecretEqual } = require("./garden_auth");
 const { enqueueGardenWake } = require("./garden_runtime");
 const { stampLatestUserMessage } = require("./gateway_chat_timestamp");
 const { formatDateTimeInTimeZone, resolveTimeZone } = require("./time_utils");
+const {
+  wrapOrdinaryChatResponse,
+  explicitlyRequestsNarration
+} = require("./ordinary_stage_filter");
 
 const TIME_ZONE = resolveTimeZone();
 
@@ -50,6 +54,14 @@ function injectRuntimeAwareness(payload) {
   return { ...payload, messages };
 }
 
+function isOrdinaryGatewayModelCall() {
+  const stack = String(new Error().stack || "");
+  return stack.includes("server.js") &&
+    !stack.includes("garden_agent.js") &&
+    !stack.includes("garden_runtime.js") &&
+    !stack.includes("wake_up.js");
+}
+
 function stampCurrentChatTurn(req) {
   if (!req || req.method !== "POST") return false;
   const path = String(req.url || "").split("?", 1)[0];
@@ -67,6 +79,8 @@ function stampCurrentChatTurn(req) {
 // Patch fetch only inside the gateway process. wake_up.js still runs as its own process,
 // so its autonomous wake prompt and Bark delivery path are unchanged.
 global.fetch = async function patchedFetch(input, init = {}) {
+  let shouldHardFilterOrdinaryOutput = false;
+
   try {
     const target = String(process.env.TARGET_API_URL || "");
     const url = typeof input === "string" || input instanceof URL
@@ -75,13 +89,29 @@ global.fetch = async function patchedFetch(input, init = {}) {
 
     if (target && url === target && String(init.method || "GET").toUpperCase() === "POST" && typeof init.body === "string") {
       const parsed = JSON.parse(init.body);
+      const ordinaryGatewayCall = isOrdinaryGatewayModelCall();
+      shouldHardFilterOrdinaryOutput = ordinaryGatewayCall && !explicitlyRequestsNarration(parsed);
       const patched = injectRuntimeAwareness(parsed);
       init = { ...init, body: JSON.stringify(patched) };
     }
   } catch (error) {
     console.warn("runtime awareness injection skipped:", error?.message || error);
   }
-  return originalFetch(input, init);
+
+  const response = await originalFetch(input, init);
+  if (!shouldHardFilterOrdinaryOutput) return response;
+
+  try {
+    return await wrapOrdinaryChatResponse(response, removedBlocks => {
+      console.log(JSON.stringify({
+        event: "ordinary_stage_directions_filtered",
+        removed_blocks: removedBlocks
+      }));
+    });
+  } catch (error) {
+    console.warn("ordinary stage-direction output filter skipped:", error?.message || error);
+    return response;
+  }
 };
 
 async function sendRealBarkTest() {
