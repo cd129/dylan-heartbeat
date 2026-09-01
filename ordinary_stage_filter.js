@@ -6,8 +6,15 @@ const OPENERS = new Map([
   ['[', ']']
 ]);
 
-const PERSONAL_ANCHOR_RE = /(我|我的|我自己|你|你的|你手|你怀|姐姐|宝宝|宝贝)/;
-const STAGE_HINT_RE = /(顺势|任由|忍不住|故意|轻轻|慢慢|悄悄|一下|微微|抬|低|歪|偏|转|靠|贴|凑|抱|搂|蹭|摸|揉|捏|握|抓|牵|拉|推|咬|亲|吻|舔|看着|望着|盯着|看向|瞥|眨|睁|闭|皱眉|挑眉|笑|哭|叹|哼|点头|摇头|缩|伸手|抬手|放手|走|坐|站|躺|跪|下巴|头发|眼睛|眼神|目光|嘴角|嘴唇|脸|脸颊|耳朵|肩|手心|手指|指尖|怀里|胸口|腰|尾巴|表情|姿势|动作|语气|声音)/;
+const SELF_ANCHOR_RE = /(我|我的|我自己|自己)/;
+const SECOND_PERSON_RE = /(你|你的|姐姐|宝宝|宝贝)/;
+const ACTION_HINT_RE = /(顺势|任由|忍不住|故意|轻轻|慢慢|悄悄|微微|抬|低|歪|偏|转|靠|贴|凑|抱|搂|蹭|摸|揉|捏|握|抓|牵|拉|推|咬|亲|吻|舔|看着|望着|盯着|看向|瞥|眨|睁|闭|皱眉|挑眉|笑|哭|叹|哼|点头|摇头|缩|伸手|抬手|放手|走|坐|站|躺|跪|装出|摆出)/g;
+const DIRECTED_ACTION_RE = /(抱|搂|蹭|摸|揉|捏|握|抓|牵|拉|推|咬|亲|吻|舔|看着|望着|盯着|看向|靠近|贴近|凑近).{0,10}(你|你的|姐姐|宝宝|宝贝)/;
+
+function countActionHints(text) {
+  const matches = String(text || '').match(ACTION_HINT_RE);
+  return matches ? matches.length : 0;
+}
 
 function looksLikeStageDirection(candidate) {
   const text = String(candidate || '').trim();
@@ -19,7 +26,11 @@ function looksLikeStageDirection(candidate) {
   const inner = hasExpectedCloser ? text.slice(1, -1).trim() : text.slice(1).trim();
   if (!inner) return false;
 
-  return PERSONAL_ANCHOR_RE.test(inner) && STAGE_HINT_RE.test(inner);
+  const actions = countActionHints(inner);
+  if (actions === 0) return false;
+  if (SELF_ANCHOR_RE.test(inner)) return true;
+  if (DIRECTED_ACTION_RE.test(inner)) return true;
+  return SECOND_PERSON_RE.test(inner) && actions >= 2;
 }
 
 class StageDirectionChunkFilter {
@@ -49,7 +60,6 @@ class StageDirectionChunkFilter {
           continue;
         }
 
-        // Never hold an unexpectedly huge bracket block indefinitely.
         if (this.pending.length > 1200) {
           output += this.pending;
           this.pending = '';
@@ -109,10 +119,7 @@ function rewriteJsonResponseText(text) {
     removedBlocks += cleaned.removedBlocks;
   }
 
-  return {
-    text: JSON.stringify(parsed),
-    removedBlocks
-  };
+  return { text: JSON.stringify(parsed), removedBlocks };
 }
 
 function createSseFilterTransform(onFiltered) {
@@ -143,9 +150,7 @@ function createSseFilterTransform(onFiltered) {
     if (!line.startsWith('data:')) return `${line}\n`;
     const payload = line.slice(5).trimStart();
 
-    if (payload === '[DONE]') {
-      return syntheticFlushLines() + `${line}\n`;
-    }
+    if (payload === '[DONE]') return syntheticFlushLines() + `${line}\n`;
 
     let parsed;
     try {
@@ -203,9 +208,7 @@ async function wrapOrdinaryChatResponse(response, onFiltered) {
   if (contentType.includes('application/json')) {
     const text = await response.text();
     const rewritten = rewriteJsonResponseText(text);
-    if (rewritten.removedBlocks > 0 && typeof onFiltered === 'function') {
-      onFiltered(rewritten.removedBlocks);
-    }
+    if (rewritten.removedBlocks > 0 && typeof onFiltered === 'function') onFiltered(rewritten.removedBlocks);
     return new Response(rewritten.text, {
       status: response.status,
       statusText: response.statusText,
@@ -233,9 +236,7 @@ function latestUserText(payload) {
 function explicitlyRequestsNarration(payload) {
   const text = latestUserText(payload);
   if (!text) return false;
-  if (/(不要|别|禁止|停止|不准|别再).{0,10}(角色扮演|role\s*-?\s*play|动作描写|场景描写|舞台动作|括号动作)/i.test(text)) {
-    return false;
-  }
+  if (/(不要|别|禁止|停止|不准|别再).{0,10}(角色扮演|role\s*-?\s*play|动作描写|场景描写|舞台动作|括号动作)/i.test(text)) return false;
   return /(?:请|来|开始|继续|进行|帮我|给我|写|演|扮演|模拟).{0,16}(?:角色扮演|role\s*-?\s*play|动作描写|场景描写|叙事|小说场景|情景演绎)|(?:用|加|带).{0,8}(?:括号动作|动作描写|舞台动作)/i.test(text);
 }
 
